@@ -1,0 +1,103 @@
+#cloud-config
+
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - docker.io
+  - nginx
+  - certbot
+  - python3-certbot-nginx 
+
+users:
+  - default
+  - name: ubuntu
+    gecos: ubuntu
+    primary_group: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: docker
+    ssh_import_id:
+    lock_passwd: false
+    ssh_authorized_keys:
+      - ${ssh_key}
+
+write_files:
+  - path: /etc/ssl/certs/certbot-nginx.crt
+    encoding: base64
+    content: ${base64encode(cert)}
+  - path: /etc/ssl/private/certbot-nginx.key
+    encoding: base64
+    content: ${base64encode(private_key)}
+  - path: /etc/nginx/sites-enabled/default
+    content: |
+      %{ for service in services }
+        #### ${service.name} ####
+        server {
+          listen 80;
+          server_name ${service.domain}.${base_domain};
+          return 301 https://$server_name$request_uri;
+        } 
+        server {
+          listen 443 ssl;
+          server_name ${service.domain}.${base_domain};
+          ssl_certificate /etc/ssl/certs/certbot-nginx.crt;
+          ssl_certificate_key /etc/ssl/private/certbot-nginx.key;
+        
+          ssl_protocols TLSv1.2 TLSv1.3;
+          ssl_prefer_server_ciphers on;
+          ssl_ciphers "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-DSS-AES128-GCM-SHA256:kEDH+AESGCM:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:DHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA:DHE-DSS-AES256-SHA256:AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-SHA256:AES128-SHA256:AES256-SHA:AES128-SHA:DHE-RSA-AES256-SHA:DHE-DSS-AES256-SHA:DHE-RSA-AES128-SHA:DHE-DSS-AES128-SHA:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!MD5:!PSK:!RC4";
+
+          add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+          location / {
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_pass http://localhost:${service.external_port}/;
+          }
+
+          location /ws {
+            proxy_pass http://localhost:${service.external_port}/ws; 
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+          }
+        }
+      %{ endfor }
+
+  - path: /usr/local/bin/sc-startup.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      systemctl docker start 
+      usermod -a -G docker ubuntu
+      docker stop $(docker ps -a -q)
+      %{ for service in services}
+
+      docker pull ${service.image} 
+      docker run --restart=always -p ${service.external_port}:${service.internal_port} -d ${service.image} 
+
+      %{ endfor }
+      sudo systemctl restart nginx.service
+  
+  - path: /etc/systemd/system/sc.service 
+    content: |
+      [Unit]
+      Description=Startup ${base_domain}
+
+      [Service]
+      ExecStart=/usr/local/bin/sc-startup.sh
+
+      [Install]
+      WantedBy=multi-user.target
+  
+runcmd:
+  - systemctl enable docker.service
+  - systemctl start docker.service
+  - systemctl enable sc.service
+  - systemctl start sc.service
+
